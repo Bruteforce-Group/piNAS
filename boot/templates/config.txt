@@ -1,0 +1,10 @@
+# Minimal piNAS config.txt template
+dtparam=spi=on
+dtparam=i2c_arm=on
+enable_uart=1
+
+# Match the Duinotech XC9022 (Adafruit PiTFT 2.8" resistive compatible)
+dtoverlay=pitft28-resistive,rotate=270,speed=32000000,fps=60
+
+# Leave the rest of the OS defaults alone – setup-sdcard.sh appends this block
+

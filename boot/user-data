@@ -1,0 +1,35 @@
+#cloud-config
+
+hostname: pinas
+
+users:
+  - name: pi
+    gecos: Pi User
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users,admin
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: $6$c70VpvPsVNCG0YR5$l5vWWLsLzt.d4M8G.lphD.0..1
+    ssh_authorized_keys: []
+
+locale: en_GB.UTF-8
+timezone: Europe/London
+
+# 3b. Configure WiFi (Zoomies)
+write_files:
+  - path: /etc/wpa_supplicant/wpa_supplicant.conf
+    content: |
+      ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+      update_config=1
+      country=GB
+      network={
+          ssid="Zoomies"
+          psk="sicbip-Vuxzok-8wymgo"
+          key_mgmt=WPA-PSK
+      }
+
+runcmd:
+  # Try to find the script in either location (Bookworm vs older)
+  - if [ -f /boot/firmware/pinas/pinas-install.sh ]; then SCRIPT=/boot/firmware/pinas/pinas-install.sh; else SCRIPT=/boot/pinas/pinas-install.sh; fi
+  - chmod +x "$SCRIPT"
+  - "$SCRIPT" > /var/log/pinas-auto-boot.log 2>&1
