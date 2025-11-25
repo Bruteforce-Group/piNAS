@@ -18,6 +18,7 @@ echo "==== piNAS installer starting at $(date) ===="
 APT_CACHE_DIR="$BOOT_MNT/pinas-apt"
 PIP_CACHE_DIR="$BOOT_MNT/pinas-py"
 PROGRESS_FILE="$BOOT_MNT/pinas-progress.json"
+INSTALL_DIR="/usr/local/pinas"
 AUTORUN_FLAG_DIR="/var/lib/pinas-installer"
 AUTORUN_FLAG="$AUTORUN_FLAG_DIR/run-on-boot.flag"
 AUTORUN_SERVICE="/etc/systemd/system/pinas-install-onboot.service"
@@ -435,24 +436,60 @@ setup_usb_nas() {
 [global]
    workgroup = WORKGROUP
    server string = piNAS
+   
+   # Guest access configuration
    security = user
    map to guest = Bad User
    guest account = nobody
    usershare allow guests = yes
-
+   restrict anonymous = 0
+   
+   # Logging
    log file = /var/log/samba/log.%m
    max log size = 1000
    logging = file
+   log level = 2
 
+   # Server configuration
    server role = standalone server
-   obey pam restrictions = yes
-   unix password sync = yes
-   pam password change = yes
-
+   local master = yes
+   preferred master = yes
+   os level = 20
+   
+   # Disable unnecessary features
    load printers = no
    disable spoolss = yes
    printing = bsd
    printcap name = /dev/null
+   show add printer wizard = no
+   
+   # Performance and compatibility
+   socket options = TCP_NODELAY IPTOS_LOWDELAY SO_RCVBUF=65536 SO_SNDBUF=65536
+   use sendfile = yes
+   aio read size = 16384
+   aio write size = 16384
+   
+   # macOS compatibility
+   vfs objects = fruit streams_xattr
+   fruit:metadata = stream
+   fruit:model = MacSamba
+   fruit:posix_rename = yes
+   fruit:veto_appledouble = no
+   fruit:wipe_intentionally_left_blank_rfork = yes
+   fruit:delete_empty_adfiles = yes
+   
+   # Windows compatibility
+   acl compatibility = auto
+   ea support = yes
+   store dos attributes = no
+   map hidden = no
+   map system = no
+   map archive = no
+   map readonly = no
+   
+   # Character encoding
+   unix charset = UTF-8
+   display charset = UTF-8
 
    include = /etc/samba/usb-shares.conf
 EOSMB
@@ -497,21 +534,118 @@ case "$ACTION" in
         ;;
     esac
 
+    # Get filesystem info
+    FS_TYPE="$(blkid -o value -s TYPE "$DEVPATH" 2>/dev/null || true)"
     LABEL="$(blkid -o value -s LABEL "$DEVPATH" 2>/dev/null || true)"
-    if [ -z "$LABEL" ]; then
-      LABEL="$DEVNAME"
+    
+    # Skip EFI system partitions and other system filesystems
+    case "$FS_TYPE" in
+      "")
+        log "unknown filesystem type for $DEVPATH, skipping"
+        exit 0
+        ;;
+      swap)
+        log "ignoring swap partition $DEVPATH"
+        exit 0
+        ;;
+    esac
+    
+    # Skip EFI partitions based on label or filesystem
+    if [ "$LABEL" = "EFI" ] || [ "$FS_TYPE" = "vfat" ]; then
+      # For FAT filesystems, check if it's really an EFI partition
+      if [ "$LABEL" = "EFI" ] || [ "$(echo "$DEVNAME" | grep -E 'p1$|s1$')" ]; then
+        # Check if it contains EFI directory structure
+        TEMP_MOUNT="$(mktemp -d)"
+        if mount "$DEVPATH" "$TEMP_MOUNT" 2>/dev/null; then
+          if [ -d "$TEMP_MOUNT/EFI" ] && [ -z "$(find "$TEMP_MOUNT" -maxdepth 1 -type f -name '*.txt' -o -name '*.doc*' -o -name '*.pdf' 2>/dev/null)" ]; then
+            umount "$TEMP_MOUNT"
+            rmdir "$TEMP_MOUNT"
+            log "ignoring EFI system partition $DEVPATH"
+            exit 0
+          fi
+          umount "$TEMP_MOUNT"
+        fi
+        rmdir "$TEMP_MOUNT"
+      fi
     fi
-
-    SAFE_LABEL="$(echo "$LABEL" | tr ' ' '-' | tr -cd 'A-Za-z0-9._-')"
+    
+    # Determine user-friendly share name
+    if [ -n "$LABEL" ] && [ "$LABEL" != "EFI" ]; then
+      SHARE_LABEL="$LABEL"
+    else
+      # Try to determine a friendly name based on device and filesystem
+      case "$FS_TYPE" in
+        ext*|btrfs|xfs)
+          SHARE_LABEL="Linux-Drive-${DEVNAME#sd}"
+          ;;
+        ntfs|exfat)
+          SHARE_LABEL="Windows-Drive-${DEVNAME#sd}"
+          ;;
+        vfat)
+          SHARE_LABEL="USB-Drive-${DEVNAME#sd}"
+          ;;
+        *)
+          SHARE_LABEL="Drive-${DEVNAME#sd}"
+          ;;
+      esac
+    fi
+    
+    # Create safe directory name (preserve more characters, handle duplicates)
+    SAFE_LABEL="$(echo "$SHARE_LABEL" | sed 's/[^A-Za-z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')"
+    
+    # Handle empty labels
+    if [ -z "$SAFE_LABEL" ]; then
+      SAFE_LABEL="USB-${DEVNAME#sd}"
+    fi
+    
+    # Handle duplicate mount points
+    ORIGINAL_LABEL="$SAFE_LABEL"
+    COUNTER=1
     MOUNT_POINT="$MOUNT_ROOT/$SAFE_LABEL"
+    while [ -d "$MOUNT_POINT" ] && mountpoint -q "$MOUNT_POINT"; do
+      SAFE_LABEL="${ORIGINAL_LABEL}-${COUNTER}"
+      MOUNT_POINT="$MOUNT_ROOT/$SAFE_LABEL"
+      COUNTER=$((COUNTER + 1))
+    done
+    
     mkdir -p "$MOUNT_POINT"
+    log "mounting $DEVPATH ($FS_TYPE, label: '$LABEL') as '$SAFE_LABEL'"
 
     if ! mountpoint -q "$MOUNT_POINT"; then
-      if ! mount -o uid="$SHARE_UID",gid="$SHARE_GID",umask=000 "$DEVPATH" "$MOUNT_POINT" 2>>/var/log/usb-autoshare.log; then
-        log "failed to mount $DEVPATH on $MOUNT_POINT"
+      # Mount with appropriate options based on filesystem type
+      MOUNT_OPTS="uid=$SHARE_UID,gid=$SHARE_GID,umask=000"
+      
+      case "$FS_TYPE" in
+        vfat|msdos)
+          MOUNT_OPTS="$MOUNT_OPTS,iocharset=utf8,shortname=mixed"
+          ;;
+        ntfs)
+          MOUNT_OPTS="$MOUNT_OPTS,windows_names,locale=en_US.UTF-8"
+          ;;
+        exfat)
+          MOUNT_OPTS="$MOUNT_OPTS,iocharset=utf8"
+          ;;
+        ext*|btrfs|xfs)
+          # For Linux filesystems, use different approach
+          if ! mount "$DEVPATH" "$MOUNT_POINT" 2>>/var/log/usb-autoshare.log; then
+            log "failed to mount $DEVPATH on $MOUNT_POINT"
+            rmdir "$MOUNT_POINT" || true
+            exit 1
+          fi
+          # Set ownership after mounting
+          chown -R "$SHARE_UID:$SHARE_GID" "$MOUNT_POINT" 2>/dev/null || true
+          chmod -R 755 "$MOUNT_POINT" 2>/dev/null || true
+          log "mounted $DEVPATH on $MOUNT_POINT (Linux filesystem)"
+          exit 0
+          ;;
+      esac
+      
+      if ! mount -o "$MOUNT_OPTS" "$DEVPATH" "$MOUNT_POINT" 2>>/var/log/usb-autoshare.log; then
+        log "failed to mount $DEVPATH on $MOUNT_POINT with options: $MOUNT_OPTS"
         rmdir "$MOUNT_POINT" || true
         exit 1
       fi
+      log "mounted $DEVPATH on $MOUNT_POINT with options: $MOUNT_OPTS"
     fi
     ;;
   remove)
@@ -525,20 +659,49 @@ esac
 TMP="$(mktemp)"
 echo "# auto-generated by usb-autoshare, do not edit by hand" > "$TMP"
 
+# Generate share configuration for each mounted USB device
 grep " $MOUNT_ROOT/" /proc/mounts | while read -r dev mp rest; do
   NAME="$(basename "$mp")"
   SHARE_NAME="$(echo "$NAME" | tr ' ' '-' | tr -cd 'A-Za-z0-9._-')"
+  
+  # Get filesystem type for the device
+  DEV_FS_TYPE="$(findmnt -n -o FSTYPE "$mp" 2>/dev/null || echo unknown)"
+  
   {
     echo
     echo "[$SHARE_NAME]"
+    echo "  comment = USB drive: $NAME ($DEV_FS_TYPE)"
     echo "  path = $mp"
     echo "  browseable = yes"
     echo "  read only = no"
     echo "  guest ok = yes"
-    echo "  create mask = 0777"
+    echo "  guest only = yes"
+    echo "  public = yes"
+    echo "  writeable = yes"
+    echo "  create mask = 0666"
     echo "  directory mask = 0777"
+    echo "  force create mode = 0666"
+    echo "  force directory mode = 0777"
     echo "  force user = $SHARE_USER"
     echo "  force group = $SHARE_GROUP"
+    echo "  inherit permissions = no"
+    echo "  inherit acls = no"
+    echo "  map archive = no"
+    echo "  map hidden = no"
+    echo "  map readonly = no"
+    echo "  map system = no"
+    echo "  store dos attributes = no"
+    
+    # Add filesystem-specific options
+    case "$DEV_FS_TYPE" in
+      vfat|msdos|ntfs|exfat)
+        echo "  delete readonly = yes"
+        echo "  dos filemode = yes"
+        ;;
+      ext*|btrfs|xfs)
+        echo "  unix extensions = no"
+        ;;
+    esac
   } >>"$TMP"
 done
 
@@ -577,11 +740,15 @@ setup_dashboard() {
 
   cat >/opt/pinas-dashboard/nas_dashboard.py <<'EOPY2'
 #!/usr/bin/env python3
+import json
 import os
 import socket
+import subprocess
 import time
+import urllib.request
+from collections import deque
 from datetime import datetime
-from typing import List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import psutil
 from PIL import Image, ImageDraw, ImageFont
@@ -1236,6 +1403,36 @@ install_packages() {
 
 finalize_install() {
   echo "--- Finalizing piNAS installation ---"
+  progress_note finalize "Installing update system"
+  
+  # Install update script if available
+  if [ -f "$INSTALL_DIR/sbin/pinas-update.sh" ]; then
+    echo "Installing update system..."
+    cp "$INSTALL_DIR/sbin/pinas-update.sh" /usr/local/sbin/
+    chmod +x /usr/local/sbin/pinas-update.sh
+    
+    # Install auto-update service and timer if available
+    if [ -f "$INSTALL_DIR/docs/pinas-auto-update.service" ] && [ -f "$INSTALL_DIR/docs/pinas-auto-update.timer" ]; then
+      cp "$INSTALL_DIR/docs/pinas-auto-update.service" /etc/systemd/system/
+      cp "$INSTALL_DIR/docs/pinas-auto-update.timer" /etc/systemd/system/
+      
+      systemctl daemon-reload
+      systemctl enable pinas-auto-update.timer || true
+      systemctl start pinas-auto-update.timer || true
+      echo "Auto-update service enabled (daily at 3 AM)"
+    fi
+    
+    # Create version file if it doesn't exist
+    if [ ! -f "$INSTALL_DIR/VERSION" ]; then
+      # Generate date-based version for local installs
+      DATE_VERSION="v$(date -u +%Y.%m.%d)"
+      BUILD_TIME="$(date -u +%H%M)"
+      echo "${DATE_VERSION}.${BUILD_TIME}" > "$INSTALL_DIR/VERSION"
+      echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "$INSTALL_DIR/BUILD_DATE"
+      echo "local-install" > "$INSTALL_DIR/BUILD_SOURCE"
+    fi
+  fi
+  
   progress_note finalize "Switching to permanent dashboard"
 
   # Kill temporary viewer to release SPI bus

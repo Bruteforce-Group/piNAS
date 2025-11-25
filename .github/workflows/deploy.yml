@@ -1,0 +1,440 @@
+name: Build and Deploy piNAS
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      target_clients:
+        description: 'Comma-separated list of client IPs/hostnames to deploy to'
+        required: false
+        default: ''
+      force_deploy:
+        description: 'Force deployment even if no changes detected'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  PINAS_VERSION: ${{ github.ref_name }}
+
+jobs:
+  validate:
+    name: Validate Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate shell scripts
+        run: |
+          echo "Validating shell script syntax..."
+          bash -n sbin/pinas-install.sh
+          bash -n sbin/pinas-cache-deps.sh
+          bash -n sbin/pinas-update.sh
+          bash -n sbin/pinas-upgrade-usb.sh
+          bash -n sbin/pinas-setup-runner.sh
+          bash -n scripts/setup-sdcard.sh
+          echo "All scripts passed syntax validation"
+
+      - name: Check cloud-init syntax
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cloud-init
+          cloud-init schema --config-file boot/user-data
+
+      - name: Validate boot templates
+        run: |
+          echo "Checking boot template files..."
+          test -f boot/templates/config.txt
+          test -f boot/templates/cmdline.txt
+          echo "Boot templates validated"
+
+  build:
+    name: Build Release Package
+    runs-on: ubuntu-latest
+    needs: validate
+    outputs:
+      package-hash: ${{ steps.package.outputs.hash }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate version info
+        id: version
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            # Generate date-based version: v2025.11.25.01
+            DATE_VERSION="v$(date -u +%Y.%m.%d)"
+            BUILD_COUNT=$(git rev-list --count HEAD)
+            DAILY_BUILD=$((BUILD_COUNT % 100 + 1))
+            VERSION="${DATE_VERSION}.$(printf "%02d" $DAILY_BUILD)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION"
+
+      - name: Create release package
+        id: package
+        run: |
+          mkdir -p dist/pinas-${{ steps.version.outputs.version }}
+          
+          # Copy core files
+          cp -r sbin/ dist/pinas-${{ steps.version.outputs.version }}/
+          cp -r boot/ dist/pinas-${{ steps.version.outputs.version }}/
+          cp -r scripts/ dist/pinas-${{ steps.version.outputs.version }}/
+          cp -r docs/ dist/pinas-${{ steps.version.outputs.version }}/
+          
+          # Create version file
+          echo "${{ steps.version.outputs.version }}" > dist/pinas-${{ steps.version.outputs.version }}/VERSION
+          echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > dist/pinas-${{ steps.version.outputs.version }}/BUILD_DATE
+          echo "${{ github.sha }}" > dist/pinas-${{ steps.version.outputs.version }}/COMMIT_HASH
+          
+          # Create checksums
+          cd dist/pinas-${{ steps.version.outputs.version }}
+          find . -type f -exec sha256sum {} \; | sort > CHECKSUMS.sha256
+          cd ../..
+          
+          # Create tarball
+          cd dist
+          tar -czf pinas-${{ steps.version.outputs.version }}.tar.gz pinas-${{ steps.version.outputs.version }}/
+          HASH=$(sha256sum pinas-${{ steps.version.outputs.version }}.tar.gz | cut -d' ' -f1)
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+          echo "Package hash: $HASH"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pinas-release-${{ steps.version.outputs.version }}
+          path: dist/pinas-${{ steps.version.outputs.version }}.tar.gz
+          retention-days: 90
+
+  deploy-to-clients:
+    name: Deploy to piNAS Clients (SSH)
+    runs-on: ubuntu-latest
+    needs: [validate, build]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        # Configure your piNAS client IPs/hostnames here
+        # For local network clients only
+        client:
+          - "pinas.local"
+          - "192.168.1.226"
+          # Add more LOCAL clients as needed:
+          # - "192.168.1.100"
+          # - "pinas-office.local"
+      fail-fast: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: pinas-release-${{ needs.build.outputs.version }}
+          path: dist/
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PINAS_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ matrix.client }} >> ~/.ssh/known_hosts
+
+      - name: Check client connectivity
+        run: |
+          ssh -o ConnectTimeout=30 pi@${{ matrix.client }} "echo 'Client ${{ matrix.client }} is reachable'"
+
+      - name: Deploy to client
+        run: |
+          # Extract package
+          cd dist
+          tar -xzf pinas-${{ needs.build.outputs.version }}.tar.gz
+          
+          # Copy update to client
+          scp -r pinas-${{ needs.build.outputs.version }}/ pi@${{ matrix.client }}:/tmp/
+          
+          # Execute deployment script on client
+          ssh pi@${{ matrix.client }} << 'EOF'
+            set -euo pipefail
+            
+            PACKAGE_DIR="/tmp/pinas-${{ needs.build.outputs.version }}"
+            INSTALL_DIR="/usr/local/pinas"
+            BACKUP_DIR="/usr/local/pinas-backup-$(date +%Y%m%d-%H%M%S)"
+            
+            echo "Starting piNAS update deployment..."
+            
+            # Create backup of current installation
+            if [ -d "$INSTALL_DIR" ]; then
+              echo "Creating backup at $BACKUP_DIR..."
+              sudo cp -r "$INSTALL_DIR" "$BACKUP_DIR"
+            fi
+            
+            # Create installation directory
+            sudo mkdir -p "$INSTALL_DIR"
+            
+            # Copy new files
+            echo "Installing new version..."
+            sudo cp -r "$PACKAGE_DIR"/* "$INSTALL_DIR"/
+            
+            # Update scripts in system locations
+            sudo cp "$INSTALL_DIR/sbin/pinas-install.sh" /usr/local/sbin/
+            sudo cp "$INSTALL_DIR/sbin/pinas-cache-deps.sh" /usr/local/sbin/
+            if [ -f "$INSTALL_DIR/sbin/pinas-update.sh" ]; then
+              sudo cp "$INSTALL_DIR/sbin/pinas-update.sh" /usr/local/sbin/
+            fi
+            if [ -f "$INSTALL_DIR/sbin/pinas-upgrade-usb.sh" ]; then
+              sudo cp "$INSTALL_DIR/sbin/pinas-upgrade-usb.sh" /usr/local/sbin/
+            fi
+            sudo chmod +x /usr/local/sbin/pinas-*.sh
+            
+            # Verify installation
+            echo "Verifying installation..."
+            bash -n /usr/local/sbin/pinas-install.sh
+            bash -n /usr/local/sbin/pinas-cache-deps.sh
+            if [ -f /usr/local/sbin/pinas-update.sh ]; then
+              bash -n /usr/local/sbin/pinas-update.sh
+            fi
+            if [ -f /usr/local/sbin/pinas-upgrade-usb.sh ]; then
+              bash -n /usr/local/sbin/pinas-upgrade-usb.sh
+            fi
+            
+            echo "Deployment completed successfully"
+            echo "Version: $(cat $INSTALL_DIR/VERSION)"
+            echo "Build date: $(cat $INSTALL_DIR/BUILD_DATE)"
+            
+            # Cleanup
+            rm -rf "$PACKAGE_DIR"
+          EOF
+
+      - name: Verify deployment
+        run: |
+          ssh pi@${{ matrix.client }} << 'EOF'
+            echo "=== Deployment Verification ==="
+            echo "Hostname: $(hostname)"
+            echo "piNAS Version: $(cat /usr/local/pinas/VERSION 2>/dev/null || echo 'Not found')"
+            echo "Dashboard Status: $(systemctl is-active pinas-dashboard.service 2>/dev/null || echo 'Not running')"
+            echo "USB Gadget Status: $(systemctl is-active pinas-usb-gadget.service 2>/dev/null || echo 'Not running')"
+            echo "Disk Usage: $(df -h / | tail -1)"
+            echo "=== End Verification ==="
+          EOF
+
+  manual-deploy:
+    name: Manual Deploy to Specified Clients
+    runs-on: ubuntu-latest
+    needs: [validate, build]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.target_clients != ''
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: pinas-release-${{ needs.build.outputs.version }}
+          path: dist/
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PINAS_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+
+      - name: Deploy to specified clients
+        run: |
+          IFS=',' read -ra CLIENTS <<< "${{ github.event.inputs.target_clients }}"
+          
+          for client in "${CLIENTS[@]}"; do
+            client=$(echo "$client" | xargs) # trim whitespace
+            echo "Deploying to client: $client"
+            
+            # Add to known hosts
+            ssh-keyscan -H "$client" >> ~/.ssh/known_hosts
+            
+            # Test connectivity
+            if ! ssh -o ConnectTimeout=30 pi@"$client" "echo 'Connected to $client'"; then
+              echo "Failed to connect to $client, skipping..."
+              continue
+            fi
+            
+            # Deploy (same logic as above)
+            cd dist
+            tar -xzf pinas-${{ needs.build.outputs.version }}.tar.gz
+            
+            scp -r pinas-${{ needs.build.outputs.version }}/ pi@"$client":/tmp/
+            
+            ssh pi@"$client" << 'EOF'
+              set -euo pipefail
+              
+              PACKAGE_DIR="/tmp/pinas-${{ needs.build.outputs.version }}"
+              INSTALL_DIR="/usr/local/pinas"
+              BACKUP_DIR="/usr/local/pinas-backup-$(date +%Y%m%d-%H%M%S)"
+              
+              echo "Deploying to $(hostname)..."
+              
+              if [ -d "$INSTALL_DIR" ]; then
+                sudo cp -r "$INSTALL_DIR" "$BACKUP_DIR"
+              fi
+              
+              sudo mkdir -p "$INSTALL_DIR"
+              sudo cp -r "$PACKAGE_DIR"/* "$INSTALL_DIR"/
+              sudo cp "$INSTALL_DIR/sbin/pinas-install.sh" /usr/local/sbin/
+              sudo cp "$INSTALL_DIR/sbin/pinas-cache-deps.sh" /usr/local/sbin/
+              if [ -f "$INSTALL_DIR/sbin/pinas-update.sh" ]; then
+                sudo cp "$INSTALL_DIR/sbin/pinas-update.sh" /usr/local/sbin/
+              fi
+              if [ -f "$INSTALL_DIR/sbin/pinas-upgrade-usb.sh" ]; then
+                sudo cp "$INSTALL_DIR/sbin/pinas-upgrade-usb.sh" /usr/local/sbin/
+              fi
+              sudo chmod +x /usr/local/sbin/pinas-*.sh
+              
+              bash -n /usr/local/sbin/pinas-install.sh
+              bash -n /usr/local/sbin/pinas-cache-deps.sh
+              if [ -f /usr/local/sbin/pinas-update.sh ]; then
+                bash -n /usr/local/sbin/pinas-update.sh
+              fi
+              if [ -f /usr/local/sbin/pinas-upgrade-usb.sh ]; then
+                bash -n /usr/local/sbin/pinas-upgrade-usb.sh
+              fi
+              
+              echo "Deployment to $(hostname) completed"
+              rm -rf "$PACKAGE_DIR"
+            EOF
+            
+            echo "Successfully deployed to $client"
+          done
+
+  deploy-to-remote-clients:
+    name: Deploy to Remote piNAS Clients (Self-Hosted)
+    runs-on: [self-hosted, pinas, remote]
+    needs: [validate, build]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: pinas-release-${{ needs.build.outputs.version }}
+          path: /tmp/pinas-update/
+
+      - name: Deploy to local piNAS
+        run: |
+          set -euo pipefail
+          
+          cd /tmp/pinas-update
+          tar -xzf pinas-${{ needs.build.outputs.version }}.tar.gz
+          
+          PACKAGE_DIR="/tmp/pinas-update/pinas-${{ needs.build.outputs.version }}"
+          INSTALL_DIR="/usr/local/pinas"
+          BACKUP_DIR="/usr/local/pinas-backup-$(date +%Y%m%d-%H%M%S)"
+          
+          echo "Starting self-hosted piNAS update deployment..."
+          echo "Hostname: $(hostname)"
+          echo "Current version: $(cat /usr/local/pinas/VERSION 2>/dev/null || echo 'unknown')"
+          echo "New version: ${{ needs.build.outputs.version }}"
+          
+          # Create backup of current installation
+          if [ -d "$INSTALL_DIR" ]; then
+            echo "Creating backup at $BACKUP_DIR..."
+            sudo cp -r "$INSTALL_DIR" "$BACKUP_DIR"
+          fi
+          
+          # Create installation directory
+          sudo mkdir -p "$INSTALL_DIR"
+          
+          # Copy new files
+          echo "Installing new version..."
+          sudo cp -r "$PACKAGE_DIR"/* "$INSTALL_DIR"/
+          
+          # Update scripts in system locations
+          sudo cp "$INSTALL_DIR/sbin/pinas-install.sh" /usr/local/sbin/
+          sudo cp "$INSTALL_DIR/sbin/pinas-cache-deps.sh" /usr/local/sbin/
+          if [ -f "$INSTALL_DIR/sbin/pinas-update.sh" ]; then
+            sudo cp "$INSTALL_DIR/sbin/pinas-update.sh" /usr/local/sbin/
+          fi
+          if [ -f "$INSTALL_DIR/sbin/pinas-upgrade-usb.sh" ]; then
+            sudo cp "$INSTALL_DIR/sbin/pinas-upgrade-usb.sh" /usr/local/sbin/
+          fi
+          if [ -f "$INSTALL_DIR/sbin/pinas-setup-runner.sh" ]; then
+            sudo cp "$INSTALL_DIR/sbin/pinas-setup-runner.sh" /usr/local/sbin/
+          fi
+          sudo chmod +x /usr/local/sbin/pinas-*.sh
+          
+          # Verify installation
+          echo "Verifying installation..."
+          bash -n /usr/local/sbin/pinas-install.sh
+          bash -n /usr/local/sbin/pinas-cache-deps.sh
+          if [ -f /usr/local/sbin/pinas-update.sh ]; then
+            bash -n /usr/local/sbin/pinas-update.sh
+          fi
+          if [ -f /usr/local/sbin/pinas-upgrade-usb.sh ]; then
+            bash -n /usr/local/sbin/pinas-upgrade-usb.sh
+          fi
+          
+          echo "Deployment completed successfully"
+          echo "Version: $(cat $INSTALL_DIR/VERSION)"
+          echo "Build date: $(cat $INSTALL_DIR/BUILD_DATE)"
+          
+          # Restart services if they exist
+          if systemctl is-active --quiet pinas-dashboard.service; then
+            echo "Restarting dashboard service..."
+            sudo systemctl restart pinas-dashboard.service
+          fi
+          
+          # Cleanup
+          rm -rf /tmp/pinas-update
+          
+          echo "=== Final Status ==="
+          echo "Hostname: $(hostname)"
+          echo "piNAS Version: $(cat /usr/local/pinas/VERSION)"
+          echo "Dashboard Status: $(systemctl is-active pinas-dashboard.service 2>/dev/null || echo 'Not running')"
+          echo "USB Gadget Status: $(systemctl is-active pinas-usb-gadget.service 2>/dev/null || echo 'Not running')"
+          echo "Disk Usage: $(df -h / | tail -1)"
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [validate, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: pinas-release-${{ needs.build.outputs.version }}
+          path: dist/
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          echo "## piNAS Release ${{ needs.build.outputs.version }}" > release_notes.md
+          echo "" >> release_notes.md
+          echo "### Changes" >> release_notes.md
+          git log --pretty=format:"- %s" $(git describe --tags --abbrev=0 HEAD^)..HEAD >> release_notes.md || echo "- Initial release" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "### Package Information" >> release_notes.md
+          echo "- **Version:** ${{ needs.build.outputs.version }}" >> release_notes.md
+          echo "- **Package Hash:** \`${{ needs.build.outputs.package-hash }}\`" >> release_notes.md
+          echo "- **Build Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> release_notes.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/pinas-${{ needs.build.outputs.version }}.tar.gz
+          body_path: release_notes.md
+          tag_name: ${{ github.ref_name }}
+          name: piNAS ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

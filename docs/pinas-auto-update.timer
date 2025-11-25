@@ -1,0 +1,15 @@
+[Unit]
+Description=piNAS Automatic Update Timer
+Documentation=https://github.com/Bruteforce-Group/piNAS
+Requires=pinas-auto-update.service
+
+[Timer]
+# Check for updates daily at 3 AM
+OnCalendar=*-*-* 03:00:00
+# Add random delay up to 30 minutes to spread load
+RandomizedDelaySec=1800
+# Run if the last scheduled run was missed (e.g., system was off)
+Persistent=true
+
+[Install]
+WantedBy=timers.target

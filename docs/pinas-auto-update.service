@@ -1,0 +1,17 @@
+[Unit]
+Description=piNAS Automatic Update Service
+Documentation=https://github.com/Bruteforce-Group/piNAS
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/pinas-update.sh
+StandardOutput=append:/var/log/pinas-auto-update.log
+StandardError=append:/var/log/pinas-auto-update.log
+TimeoutSec=1800
+
+[Install]
+WantedBy=multi-user.target

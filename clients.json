@@ -1,0 +1,22 @@
+{
+  "clients": [
+    {
+      "hostname": "pinas.local",
+      "ip": "auto",
+      "description": "Default local piNAS",
+      "deployment_type": "ssh",
+      "added_date": "2025-11-25",
+      "status": "active"
+    },
+    {
+      "hostname": "pinas-226",
+      "ip": "192.168.1.226",
+      "description": "piNAS at 192.168.1.226",
+      "deployment_type": "ssh", 
+      "added_date": "2025-11-25",
+      "status": "pending_setup"
+    }
+  ],
+  "deployment_key_fingerprint": "",
+  "last_updated": "2025-11-25T05:10:50Z"
+}
