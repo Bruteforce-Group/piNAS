@@ -12,11 +12,6 @@ on:
         description: 'Comma-separated list of client IPs/hostnames to deploy to'
         required: false
         default: ''
-      force_deploy:
-        description: 'Force deployment even if no changes detected'
-        required: false
-        type: boolean
-        default: false
 
 env:
   PINAS_VERSION: ${{ github.ref_name }}
