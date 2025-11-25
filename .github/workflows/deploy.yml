@@ -423,7 +423,7 @@ jobs:
           echo "- **Build Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> release_notes.md
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: dist/pinas-${{ needs.build.outputs.version }}.tar.gz
           body_path: release_notes.md
