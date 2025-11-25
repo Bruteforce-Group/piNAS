@@ -242,8 +242,8 @@ Set up the **permanent** XC9022 dashboard which runs on boot and shows NAS statu
 
 1. Ensure the dashboard venv has extra packages:
    - `adafruit-circuitpython-stmpe610` – for XC9022 shields that use STMPE610 touch.
-   - `adafruit-circuitpython-xpt2046` – for shields that use the XPT2046 touch controller (driver borrowed from the ESP32 project). 
    - `psutil` – for CPU/memory/disk/network stats.
+   - (The XPT2046 touch handling reuses the STMPE610 dependency and Marauder-derived calibration curves, so no additional pip package is needed.)
    - Uses `pip_install_offline_first` with `/opt/pinas-dashboard/.venv/bin`.
 
 2. Create `/opt/pinas-dashboard/nas_dashboard.py`:
@@ -291,7 +291,7 @@ Set up the **permanent** XC9022 dashboard which runs on boot and shows NAS statu
    - `systemctl daemon-reload`
    - `systemctl enable --now pinas-dashboard.service || true`
 
-Result: on each boot, the XC9022 displays the NAS dashboard as a continuous status panel. During startup the dashboard now probes for `STMPE610` first and falls back to `XPT2046`, applying controller-specific calibration curves (the XPT numbers come from the ESP32 Marauder implementation). If no touch controller responds, the dashboard keeps running with tap-to-toggle disabled.
+Result: on each boot, the XC9022 displays the NAS dashboard as a continuous status panel. During startup the dashboard now probes for `STMPE610` first and falls back to `XPT2046`, applying controller-specific calibration curves (the XPT numbers come from the ESP32 Marauder implementation). If no touch controller responds, the dashboard keeps running with tap-to-toggle disabled. A rotation safeguard also renders off-screen at 320×240 and only then rotates the buffer before sending it to the driver, preventing the Adafruit library from raising the “Image must not exceed …” error when the hardware reports a 240×320 framebuffer.
 
 ---
 
