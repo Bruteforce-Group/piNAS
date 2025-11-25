@@ -422,24 +422,26 @@ jobs:
           echo "- **Package Hash:** \`${{ needs.build.outputs.package-hash }}\`" >> release_notes.md
           echo "- **Build Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> release_notes.md
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Publish Release via gh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          release_name: piNAS ${{ github.ref_name }}
-          body_path: release_notes.md
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: dist/pinas-${{ needs.build.outputs.version }}.tar.gz
-          asset_name: pinas-${{ needs.build.outputs.version }}.tar.gz
-          asset_content_type: application/gzip
+          TAG="${{ github.ref_name }}"
+          TITLE="piNAS $TAG"
+          ASSET_PATH="dist/pinas-${{ needs.build.outputs.version }}.tar.gz"
+          PRERELEASE_FLAG=""
+          if [[ "${{ contains(github.ref_name, '-') }}" == "true" ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          # Delete existing release/tag if we are re-running
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes
+          fi
+
+          gh release create "$TAG" "$ASSET_PATH" \
+            --title "$TITLE" \
+            --notes-file release_notes.md \
+            $PRERELEASE_FLAG
