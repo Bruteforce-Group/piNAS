@@ -1,3 +1,13 @@
 .DS_Store
 archive/boot-stock-full/
+dist/
+infra/cloudflare/node_modules/
+infra/cloudflare/.wrangler/
 
+# Ignore user-data with real WiFi credentials
+boot/user-data
+
+# Environment files with secrets
+.env
+*.env
+!*.env.example

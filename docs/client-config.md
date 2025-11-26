@@ -1,148 +1,136 @@
 # piNAS Client Configuration
 
-This document explains how to configure automatic deployments to your piNAS clients.
+GitHub Actions deployments are blocked while the organization is on a billing
+hold, so piNAS now uses a pull-based flow backed by Cloudflare Worker/R2.
 
-## Quick Setup
+Each client periodically calls the Worker to retrieve metadata and downloads the
+release artifact through the same Worker (which streams from R2). This document
+explains how to onboard clients and publish new builds.
 
-### 1. Add Your Client IPs/Hostnames
+## Prerequisites
 
-Edit `.github/workflows/deploy.yml` and update the client matrix around line 119:
+1. Deploy the Worker in `infra/cloudflare/` (see that folder's README).
+2. Create:
+   - An R2 bucket for artifacts (e.g. `pinas-artifacts`)
+   - A Workers KV namespace for client metadata
+3. Store the Worker admin secret with `wrangler secret put ADMIN_TOKEN`.
+4. Export the Worker values locally before using the helper scripts:
 
-```yaml
-client:
-  - "pinas.local"              # Default hostname
-  - "192.168.1.100"           # Example: specific IP
-  - "pinas-office.local"      # Example: office piNAS  
-  - "pinas-lab.bruteforce.group" # Example: remote piNAS
-```
+   ```bash
+   export WORKER_URL="https://pinas-deployer.example.workers.dev"
+   export WORKER_ADMIN_TOKEN="<same random string stored via wrangler>"
+   ```
 
-### 2. Setup SSH Access
+5. Generate (or reuse) the deployment SSH key:
 
-Generate a deployment key:
+   ```bash
+   ssh-keygen -t ed25519 -C "pinas-deployment" -f ~/.ssh/pinas_deploy
+   ```
+
+## Adding a client
+
+1. Register it in `clients.json`:
+
+   ```bash
+   ./scripts/manage-clients.sh add 192.168.1.226 pinas-226
+   ```
+
+   The helper automatically gives every client a `client_id` slug.
+
+2. Provision SSH and Worker credentials:
+
+   ```bash
+   ./scripts/manage-clients.sh setup-key 192.168.1.226
+   ```
+
+   This command:
+
+   - installs the deployment public key into `~pi/.ssh/authorized_keys`
+   - generates a unique `CLIENT_TOKEN`
+   - registers the client through `PUT $WORKER_URL/admin/clients/<client_id>`
+   - writes `/etc/pinas/update-endpoint.env` on the Pi:
+
+     ```bash
+     WORKER_URL="https://pinas-deployer.example.workers.dev"
+     CLIENT_ID="pinas-226"
+     CLIENT_TOKEN="b2eb9d5a..."
+     ```
+
+3. Sanity-check access:
+
+   ```bash
+   ./scripts/manage-clients.sh test 192.168.1.226
+   ```
+
+## Publishing a release
+
+Run the helper from repo root:
+
 ```bash
-ssh-keygen -t ed25519 -C "pinas-deployment@github.com" -f ~/.ssh/pinas_deploy
+export PINAS_R2_BUCKET="pinas-artifacts"
+export PINAS_WORKER_URL="$WORKER_URL"
+export PINAS_WORKER_ADMIN_TOKEN="$WORKER_ADMIN_TOKEN"
+./scripts/publish-artifact.sh         # pass --version vX.Y.Z to override
 ```
 
-Add the **private key** to GitHub repository secrets:
-- Go to your repo → Settings → Secrets and variables → Actions
-- Click "New repository secret"
-- Name: `PINAS_SSH_PRIVATE_KEY`  
-- Value: Contents of `~/.ssh/pinas_deploy` (the private key file)
+It will:
 
-Add the **public key** to each piNAS client:
+1. Build `dist/pinas-<version>.tar.gz`
+2. Upload it to `r2://$PINAS_R2_BUCKET/<version>/pinas-<version>.tar.gz`
+3. Call `POST $WORKER_URL/admin/artifacts` with the version, object key, SHA-256,
+   and size
+
+Once the metadata is published, every piNAS sees the update during its next poll
+or when `sudo pinas-update --force` runs manually.
+
+## Manual update trigger
+
+SSH to a client and run:
+
 ```bash
-# Copy the public key
-cat ~/.ssh/pinas_deploy.pub
-
-# On each piNAS client, add it to authorized_keys
-ssh pi@your-pinas-ip "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-cat ~/.ssh/pinas_deploy.pub | ssh pi@your-pinas-ip "cat >> ~/.ssh/authorized_keys"
-ssh pi@your-pinas-ip "chmod 600 ~/.ssh/authorized_keys"
+sudo /usr/local/sbin/pinas-update --force
 ```
 
-### 3. Test the Setup
+The script now:
 
-Push a commit to main branch or manually trigger deployment:
-```bash
-git add .
-git commit -m "test: automatic deployment"
-git push origin main
-```
+1. Loads `/etc/pinas/update-endpoint.env`
+2. POSTs to `$WORKER_URL/client/state`
+3. Downloads the artifact through `GET $WORKER_URL/artifact?objectKey=...`
+4. Verifies the Worker-provided checksum
+5. Installs the package and restarts the piNAS services
 
-Watch the deployment in GitHub Actions: `repo → Actions → Build and Deploy piNAS`
+## Rotating client tokens
 
-## Current Client Configuration
+1. Generate a new token:
 
-Based on your setup, you should have:
+   ```bash
+   NEW_TOKEN=$(openssl rand -hex 32)
+   ```
 
-- **Default client**: `pinas.local` (already configured)
-- **Add your clients**: Edit the workflow file to include your actual client IPs
+2. Update the Worker record:
 
-## How Automatic Deployment Works
+   ```bash
+   curl -X PUT "$WORKER_URL/admin/clients/pinas-226" \
+     -H "Authorization: Bearer $WORKER_ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d "{\"displayName\":\"pinas-226\",\"token\":\"$NEW_TOKEN\"}"
+   ```
 
-### Triggers
-- **Commits to main**: Automatically deploys to all configured clients
-- **Tagged releases**: Creates GitHub release + deploys to clients  
-- **Manual trigger**: Deploy to specific clients via GitHub Actions web UI
+3. Update the file on the Pi:
 
-### What Happens During Deployment
-1. **Validation**: All scripts are syntax-checked
-2. **Package Build**: Creates versioned release package with checksums
-3. **SSH Connection**: Connects to each client using deployment key
-4. **Backup**: Creates timestamped backup of current installation
-5. **Update**: Copies new files and updates system scripts
-6. **Verification**: Tests script syntax and service status
-7. **Cleanup**: Removes temporary files
+   ```bash
+   ssh pi@192.168.1.226 <<EOF
+   sudo tee /etc/pinas/update-endpoint.env >/dev/null <<'CONF'
+   WORKER_URL="$WORKER_URL"
+   CLIENT_ID="pinas-226"
+   CLIENT_TOKEN="$NEW_TOKEN"
+   CONF
+   sudo chmod 600 /etc/pinas/update-endpoint.env
+   EOF
+   ```
 
-### Deployment Safety
-- **Automatic backups**: Every deployment creates a backup
-- **Script validation**: Syntax errors prevent deployment
-- **Service verification**: Confirms services are running after update
-- **Rollback ready**: Backups enable easy rollback if needed
+## Legacy GitHub Actions workflow
 
-## Managing Multiple Environments
-
-### Development/Testing Clients
-Add test clients to the matrix for development deployments:
-```yaml
-client:
-  - "pinas-dev.local"     # Development piNAS
-  - "pinas-test.local"    # Testing piNAS
-```
-
-### Production Clients
-For production, consider using tags instead of automatic main deployment:
-```bash
-# Deploy to production with tagged release
-git tag v1.2.0
-git push origin v1.2.0
-```
-
-### Environment-Specific Configuration
-You can create different workflows for different environments:
-- `.github/workflows/deploy-dev.yml` - Deploy to dev/test on main commits
-- `.github/workflows/deploy-prod.yml` - Deploy to production on tags only
-
-## Troubleshooting
-
-### SSH Connection Issues
-```bash
-# Test SSH access manually
-ssh -i ~/.ssh/pinas_deploy pi@your-client-ip "echo 'Connection OK'"
-
-# Check SSH key in GitHub secrets
-# Go to repo → Settings → Secrets → PINAS_SSH_PRIVATE_KEY
-```
-
-### Client Discovery Issues
-```bash
-# Test hostname resolution
-ping pinas.local
-
-# Try IP address instead of hostname
-# Replace "pinas.local" with specific IP in workflow
-```
-
-### Deployment Failures
-- Check GitHub Actions logs for detailed error messages
-- Verify client is reachable and SSH key is properly configured
-- Ensure client has sufficient disk space for updates
-
-## Security Best Practices
-
-### SSH Key Management
-- Use dedicated deployment keys (not your personal SSH key)
-- Rotate keys periodically
-- Limit key access to deployment operations only
-
-### Network Security  
-- Ensure clients are only accessible from trusted networks
-- Use VPN for remote clients
-- Monitor deployment logs for unauthorized access attempts
-
-### Access Control
-- Limit GitHub repository access to authorized users only
-- Use branch protection rules for main branch
-- Require pull request reviews for sensitive changes
-
-This configuration enables fully automated deployments while maintaining security and reliability.
+`.github/workflows/deploy.yml` is left in place for reference but is no longer
+invoked while the GitHub billing hold remains. All new deployments should rely
+on the Worker/R2 workflow described above.

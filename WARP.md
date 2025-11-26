@@ -35,9 +35,9 @@ piNAS uses date-based versioning: `v2025.11.25.01` (Year.Month.Day.Build)
 - `setup-sdcard.sh` - Workstation script to prepare SD cards for installation
 
 **Remote Client Support**
-- Self-hosted GitHub Actions runners for remote piNAS clients
-- Automatic deployment over internet connections
-- No VPN or direct network access required
+- Cloudflare Worker coordination for remote + local clients
+- Pull-based updater with per-device Worker tokens
+- No inbound SSH exposure required on WAN links
 
 ### Installation Flow
 
@@ -88,28 +88,19 @@ bash -n sbin/pinas-upgrade-usb.sh
 ### Deployment and Updates
 
 ```bash
-# Automatic deployment (triggers on commit to main)
-git add .
-git commit -m "fix: improve USB detection"
-git push origin main
+# Publish a release to Cloudflare R2 and notify the Worker metadata
+./scripts/publish-artifact.sh --version v2025.11.26.01
 
-# Create a release (triggers GitHub Actions deployment)
-git tag v1.0.0
-git push origin v1.0.0
+# Register a client + provision Worker token
+./scripts/manage-clients.sh add 192.168.1.226 pinas-226
+./scripts/manage-clients.sh setup-key 192.168.1.226
 
-# Manual deployment via GitHub Actions
-# Go to Actions > Build and Deploy piNAS > Run workflow
-# Specify target clients: "192.168.1.100, pinas.local"
-
-# Test client update locally
-sudo /usr/local/sbin/pinas-update.sh --check-only
-sudo /usr/local/sbin/pinas-update.sh --version v1.0.0
+# Manual client update / verification
+ssh pi@pinas.local sudo /usr/local/sbin/pinas-update.sh --check-only
+ssh pi@pinas.local sudo /usr/local/sbin/pinas-update.sh --force
 
 # Upgrade existing USB sharing (fixes EFI detection and permissions)
 sudo /usr/local/sbin/pinas-upgrade-usb.sh
-
-# Setup remote client (for internet-connected piNAS clients)
-sudo /usr/local/sbin/pinas-setup-runner.sh
 ```
 
 ### Development Workflow
@@ -155,19 +146,19 @@ sudo /usr/local/sbin/pinas-setup-runner.sh
 
 ```
 piNAS/
-├── .github/workflows/    # GitHub Actions CI/CD
+├── .github/workflows/    # Legacy GitHub Actions CI/CD (kept for reference)
+├── infra/cloudflare/     # Cloudflare Worker project (Wrangler, KV, R2)
 ├── sbin/                 # Main installation scripts
 │   ├── pinas-install.sh  # Main installer
 │   ├── pinas-cache-deps.sh # Dependency cacher
-│   ├── pinas-update.sh   # Client update script
-│   ├── pinas-upgrade-usb.sh # USB sharing upgrade script
-│   └── pinas-setup-runner.sh # Remote client runner setup
+│   ├── pinas-update.sh   # Worker/R2 client update script
+│   └── pinas-upgrade-usb.sh # USB sharing upgrade script
 ├── boot/                 # Boot configuration and cloud-init
 │   ├── templates/        # Reference Pi config files
 │   └── user-data         # Cloud-init automation
 ├── scripts/              # Development and setup utilities
 ├── docs/                 # Documentation
-│   ├── deployment-setup.md # GitHub Actions setup guide
+│   ├── deployment-setup.md # Cloudflare Worker deployment guide
 │   ├── client-config.md  # Client deployment configuration
 │   ├── pinas-auto-update.service # Systemd service
 │   └── pinas-auto-update.timer   # Systemd timer
@@ -184,8 +175,8 @@ piNAS/
 - Progress tracking allows monitoring via SSH or TFT display
 - USB shares auto-configured with guest Samba access
 - Touch interaction toggles dashboard detail/compact views
-- **Automatic deployment**: Commits to main branch trigger immediate client updates
-- GitHub Actions provides automated deployment to multiple clients
+- **Automatic deployment**: Clients poll the Worker (timer or manual) and self-update
+- Cloudflare Worker + R2 manage artifact distribution without GitHub Actions
 - Client update system with automatic daily checks (3 AM)
 - Update rollback capability with automatic backups
 

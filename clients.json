@@ -1,6 +1,7 @@
 {
   "clients": [
     {
+      "client_id": "pinas-local",
       "hostname": "pinas.local",
       "ip": "auto",
       "description": "Default local piNAS",
@@ -9,6 +10,7 @@
       "status": "active"
     },
     {
+      "client_id": "pinas-226",
       "hostname": "pinas-226",
       "ip": "192.168.1.226",
       "description": "piNAS at 192.168.1.226",

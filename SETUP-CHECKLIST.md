@@ -1,105 +1,98 @@
-# piNAS Automatic Deployment Setup Checklist
+# piNAS Worker Deployment Setup Checklist
 
-Complete these steps to enable automatic deployment to your piNAS clients when you commit to main.
+Follow these steps to enable the new Cloudflare Worker + R2 deployment flow. You
+can complete them in a single terminal session on your workstation.
 
-## ✅ Setup Steps
+## 1. Generate / reuse the deployment SSH key
 
-### 1. Generate SSH Deployment Key
 ```bash
-ssh-keygen -t ed25519 -C "pinas-deployment@github.com" -f ~/.ssh/pinas_deploy
+ssh-keygen -t ed25519 -C "pinas-deployment" -f ~/.ssh/pinas_deploy
 ```
 
-### 2. Add Private Key to GitHub Secrets
-- Go to: https://github.com/Bruteforce-Group/piNAS/settings/secrets/actions
-- Click "New repository secret"
-- Name: `PINAS_SSH_PRIVATE_KEY`
-- Value: Paste contents of `~/.ssh/pinas_deploy` (private key)
+The private key stays on your workstation. The `setup-key` helper copies the
+public key to each Pi automatically.
 
-### 3. Add Public Key to piNAS Clients
+## 2. Deploy the Worker stack
+
 ```bash
-# View the public key
-cat ~/.ssh/pinas_deploy.pub
-
-# Add to each piNAS client
-ssh pi@pinas.local "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-cat ~/.ssh/pinas_deploy.pub | ssh pi@pinas.local "cat >> ~/.ssh/authorized_keys"
-ssh pi@pinas.local "chmod 600 ~/.ssh/authorized_keys"
-# Repeat for each client IP/hostname
+cd infra/cloudflare
+npm install
+wrangler kv namespace create pinas-clients
+wrangler kv namespace create pinas-clients --preview
+wrangler r2 bucket create pinas-artifacts
+wrangler r2 bucket create pinas-artifacts-dev
+# Update wrangler.toml with the IDs above, then:
+wrangler secret put ADMIN_TOKEN
+npm run deploy -- --env production
 ```
 
-### 4. Configure Client List
-Edit `.github/workflows/deploy.yml` around line 119:
-```yaml
-client:
-  - "pinas.local"              # Local network clients
-  - "192.168.1.100"           # Add your local client IPs
-  - "pinas-office.local"      # Add local hostnames
-```
+## 3. Export the Worker credentials locally
 
-**For remote clients over internet:**
-- Run `sudo /usr/local/sbin/pinas-setup-runner.sh` on the remote piNAS
-- This sets up a self-hosted GitHub Actions runner
-- No need to add remote clients to the SSH deployment list
-
-### 5. Test the Setup
 ```bash
-# Make a test change and commit
-echo "# Test automatic deployment" >> README.md
-git add README.md
-git commit -m "test: automatic deployment"
-git push origin main
+export WORKER_URL="https://pinas-deployer.example.workers.dev"
+export WORKER_ADMIN_TOKEN="<matching ADMIN_TOKEN>"
+export PINAS_R2_BUCKET="pinas-artifacts"
 ```
 
-### 6. Monitor Deployment
-- Go to: https://github.com/Bruteforce-Group/piNAS/actions
-- Watch the "Build and Deploy piNAS" workflow run
-- Check that all clients are successfully updated
+Keep these exports in your shell (or add them to your shell profile) before
+using the helper scripts.
 
-## 🔧 What Happens Next
+## 4. Register each client
 
-**On every commit to main:**
-1. ✅ Scripts are validated for syntax errors
-2. 📦 Release package is built with checksums
-3. 🚀 Package is deployed to all configured clients
-4. 🛡️ Backup is created before updating
-5. ✅ Installation is verified on each client
-
-**Deployment safety features:**
-- Automatic backups before each update
-- Script validation prevents broken deployments  
-- Service verification confirms successful updates
-- Rollback capability if issues occur
-
-## 🎯 Current Configuration
-
-- **Trigger**: Commits to `main` branch (automatic)
-- **Default client**: `pinas.local` (edit workflow to add your clients)
-- **Backup location**: `/usr/local/pinas-backup-YYYYMMDD-HHMMSS/`
-- **Update logs**: Check GitHub Actions for deployment status
-
-## 🚨 Troubleshooting
-
-### SSH Connection Issues
 ```bash
-# Test SSH access manually
-ssh -i ~/.ssh/pinas_deploy pi@pinas.local "echo 'Connection OK'"
+./scripts/manage-clients.sh add 192.168.1.226 pinas-226
+./scripts/manage-clients.sh setup-key 192.168.1.226
+./scripts/manage-clients.sh test 192.168.1.226
 ```
 
-### Client Not Found
-- Verify client hostname resolves: `ping pinas.local`
-- Try IP address instead of hostname
-- Check client is powered on and connected to network
+`setup-key` will:
 
-### Permission Issues
-- Ensure public key is in `~/.ssh/authorized_keys` on each client
-- Check private key is correctly set in GitHub repository secrets
+1. Install the SSH deployment key on the Pi
+2. Generate a Worker token and register `client_id`
+3. Write `/etc/pinas/update-endpoint.env`
 
-## 📚 Additional Documentation
+## 5. Publish an artifact
 
-- **Full setup guide**: `docs/deployment-setup.md`
-- **Client configuration**: `docs/client-config.md`
-- **Project overview**: `WARP.md`
+```bash
+./scripts/publish-artifact.sh --version v2025.11.26.01
+```
 
----
+The helper builds `dist/pinas-<version>.tar.gz`, uploads it to R2, and calls the
+Worker admin API so that every client can see the new metadata.
 
-**Ready to go!** Once setup is complete, every commit you push to main will automatically update all your piNAS clients. No more manual SD card preparation or individual client updates needed!
+## 6. Trigger/verify updates
+
+- **Automatic**: `pinas-auto-update.timer` runs nightly at 03:00.
+- **Manual**: `ssh pi@host sudo /usr/local/sbin/pinas-update.sh --force`.
+- **Logs**: `/var/log/pinas-update.log` on each Pi + `wrangler tail` for Worker
+  requests.
+
+## Quick reference
+
+| Task | Command |
+|------|---------|
+| List clients | `./scripts/manage-clients.sh list` |
+| Add client | `./scripts/manage-clients.sh add <ip> <host>` |
+| Provision key + Worker token | `./scripts/manage-clients.sh setup-key <ip>` |
+| Publish release | `./scripts/publish-artifact.sh [--version vX.Y.Z]` |
+| Check Worker health | `curl "$WORKER_URL/healthz"` |
+| Force update on Pi | `ssh pi@host sudo /usr/local/sbin/pinas-update.sh --force` |
+
+## Troubleshooting
+
+- **Worker auth errors**: confirm `WORKER_URL` and `WORKER_ADMIN_TOKEN` are set
+  locally and in the Worker secrets.
+- **Client unauthorized**: rerun `setup-key` to mint a fresh token or update
+  `/etc/pinas/update-endpoint.env` manually.
+- **Artifact missing**: run `wrangler r2 object list pinas-artifacts` to confirm
+  the upload succeeded, then call the admin API again:
+  ```bash
+  curl -X POST "$WORKER_URL/admin/artifacts" \
+    -H "Authorization: Bearer $WORKER_ADMIN_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"version":"v2025.11.26.01","objectKey":"v2025.11.26.01/pinas-v2025.11.26.01.tar.gz","sha256":"...","size":1234}'
+  ```
+
+Once the steps above are complete, every piNAS automatically checks in with the
+Worker, downloads the correct artifact from R2, and installs it without relying
+on GitHub Actions. 🎉

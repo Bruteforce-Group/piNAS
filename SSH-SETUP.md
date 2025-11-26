@@ -1,60 +1,67 @@
-# SSH Setup for piNAS Automatic Deployment
+# SSH Setup for Worker Deployments
 
-## Quick Setup for 192.168.1.226
+The Worker/R2 deployment path still needs SSH so we can provision each piNAS with
+the shared updater configuration. These steps assume you’re running commands
+from `/Users/danielborrowman/Developer/Projects/piNAS` on your workstation.
 
-1. **Connect to your piNAS:**
-   ```bash
-   ssh pi@192.168.1.226
-   ```
+## 1. Generate (or reuse) the deployment key
 
-2. **Add the deployment public key:**
-   ```bash
-   # From your workstation
-   ssh pi@192.168.1.226 "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-   cat ~/.ssh/pinas_deploy.pub | ssh pi@192.168.1.226 "cat >> ~/.ssh/authorized_keys"
-   ssh pi@192.168.1.226 "chmod 600 ~/.ssh/authorized_keys"
-   ```
-
-3. **Test the connection from your dev machine:**
-   ```bash
-   cd /Users/danielborrowman/Developer/Projects/piNAS
-   ./scripts/manage-clients.sh test 192.168.1.226
-   ```
-
-## Next Steps
-
-Once SSH is working:
-
-1. **Sync workflow** to update GitHub Actions:
-   ```bash
-   ./scripts/manage-clients.sh sync-workflow
-   ```
-
-2. **Add private key to GitHub Secrets:**
-   - Go to: https://github.com/your-username/piNAS/settings/secrets/actions
-   - Add new secret: `PINAS_SSH_PRIVATE_KEY`
-   - Copy the contents of: `/Users/danielborrowman/.ssh/pinas_deploy`
-
-3. **Test automatic deployment:**
-   ```bash
-   # Make a small change and commit
-   echo "# Test deployment $(date)" >> README.md
-   git add .
-   git commit -m "test: trigger automatic deployment"
-   git push origin main
-   ```
-
-## Alternative: Use ssh-copy-id
-
-If you have `ssh-copy-id` available:
 ```bash
-ssh-copy-id -i ~/.ssh/pinas_deploy.pub pi@192.168.1.226
+ssh-keygen -t ed25519 -C "pinas-deployment" -f ~/.ssh/pinas_deploy
 ```
+
+Keep the private key on your workstation only. The helper scripts copy the
+public key to each Pi.
+
+## 2. Recommended flow (automated)
+
+```bash
+./scripts/manage-clients.sh add 192.168.1.226 pinas-226
+./scripts/manage-clients.sh setup-key 192.168.1.226
+```
+
+`setup-key` will:
+
+1. SSH in as `pi@192.168.1.226` using your password one time
+2. Install the deployment public key into `~/.ssh/authorized_keys`
+3. Generate a Worker client token, register it via `/admin/clients/:id`, and
+   write `/etc/pinas/update-endpoint.env`
+
+After it finishes, test:
+
+```bash
+./scripts/manage-clients.sh test 192.168.1.226
+```
+
+## 3. Manual fallback (if the helper can’t connect)
+
+```bash
+ssh pi@192.168.1.226 "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+cat ~/.ssh/pinas_deploy.pub | ssh pi@192.168.1.226 "cat >> ~/.ssh/authorized_keys"
+ssh pi@192.168.1.226 "chmod 600 ~/.ssh/authorized_keys"
+```
+
+Then rerun `./scripts/manage-clients.sh setup-key <host>` so it can finish the
+Worker registration and push the `/etc/pinas/update-endpoint.env` file.
+
+## 4. Validate updater connectivity
+
+```bash
+ssh pi@192.168.1.226 sudo /usr/local/sbin/pinas-update.sh --check-only
+ssh pi@192.168.1.226 sudo /usr/local/sbin/pinas-update.sh --force   # optional
+```
+
+If the script reports “update available” it will download directly from the
+Worker-provided URL (Cloudflare R2).
 
 ## Troubleshooting
 
-- **Permission denied**: Check SSH service is running on piNAS
-- **Connection refused**: Verify piNAS is accessible and SSH is enabled
-- **Key not working**: Ensure proper file permissions (600 for authorized_keys, 700 for .ssh)
+- **Permission denied**: ensure SSH is enabled (create `/boot/ssh` on the SD
+  card) and the Pi is reachable.
+- **Key rejected**: verify ownership/permissions (`~/.ssh` = 700,
+  `authorized_keys` = 600) on the Pi.
+- **Worker unauthorized**: re-run `setup-key` to rotate the token, or edit
+  `/etc/pinas/update-endpoint.env` with the values shown in `docs/client-config.md`.
 
-The deployment system will automatically update your piNAS whenever you push changes to the main branch!
+With SSH + Worker credentials in place, each piNAS can self-update via
+`pinas-update.sh` without GitHub Actions.

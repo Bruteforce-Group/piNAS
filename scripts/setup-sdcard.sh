@@ -169,6 +169,9 @@ mkdir -p "$VOL_NAME/pinas"
 echo "Copying installer scripts..."
 cp "$REPO_ROOT/sbin/pinas-install.sh" "$VOL_NAME/pinas/"
 cp "$REPO_ROOT/sbin/pinas-cache-deps.sh" "$VOL_NAME/pinas/"
+if [ -f "$REPO_ROOT/sbin/pinas-update.sh" ]; then
+    cp "$REPO_ROOT/sbin/pinas-update.sh" "$VOL_NAME/pinas/"
+fi
 if [ -f "$REPO_ROOT/sbin/pinas-pull-update.sh" ]; then
     cp "$REPO_ROOT/sbin/pinas-pull-update.sh" "$VOL_NAME/pinas/"
 fi
@@ -286,14 +289,15 @@ echo "   • USB: Will appear as storage device when connected via USB-C"
 if [ -n "$CLIENT_IP" ]; then
     echo ""
     echo "🔐 Deployment Setup Reminder:"
-    echo "   Use the helper to register this Pi for GitHub Actions deployments:"
+    echo "   Register this Pi with the Cloudflare Worker deployment API:"
+    echo "   export WORKER_URL=\"https://<your-worker>.workers.dev\""
+    echo "   export WORKER_ADMIN_TOKEN=\"<admin-token>\""
     echo "   $REPO_ROOT/scripts/manage-clients.sh setup-key $CLIENT_IP"
     echo ""
-    echo "   After the device is online, run:"
+    echo "   After the device is online, validate connectivity:"
     echo "   $REPO_ROOT/scripts/manage-clients.sh test $CLIENT_IP"
-    echo "   $REPO_ROOT/scripts/manage-clients.sh sync-workflow"
     echo ""
-    echo "   Detailed instructions: DEPLOY-KEY-SOLUTION.md"
+    echo "   See docs/client-config.md for the full workflow."
 fi
 
 echo ""

@@ -1,111 +1,91 @@
-# piNAS Deployment System - Setup Complete ✅
+# piNAS Deployment System – Current State ✅
 
-The comprehensive piNAS deployment system has been successfully implemented! Here's what's ready and what needs manual completion.
+The GitHub Actions pipeline is paused because the Bruteforce-Group enterprise
+account is on a billing hold, so deployments now flow through a pull-based
+system that mirrors the Tesla-WebRTC approach: Cloudflare Workers coordinate the
+rollout, R2 hosts release artifacts, and each piNAS polls for updates with an
+API token.
 
-## ✅ Completed Features
+## ✅ What’s Finished
 
-### 1. **Client Management System**
-- `scripts/manage-clients.sh` - Full client lifecycle management
-- Automatic client registration during SD card setup
-- SSH key deployment and testing
-- Status monitoring and workflow synchronization
+1. **Cloudflare Worker stack**
+   - `infra/cloudflare` contains the Worker, KV, and R2 bindings.
+   - Admin API supports `/admin/clients` and `/admin/artifacts`.
+   - Client API supports `/client/state` and `/artifact`.
 
-### 2. **Enhanced SD Card Setup**
-- `scripts/setup-sdcard.sh` now supports `--client-ip` for automatic deployment setup
-- Integrated client registration during SD preparation
-- Automatic next-steps guidance for SSH configuration
+2. **Artifact publisher**
+   - `scripts/publish-artifact.sh` builds `dist/pinas-<version>.tar.gz`,
+     uploads it to R2 via Wrangler, and updates Worker metadata.
 
-### 3. **GitHub Actions Deployment**
-- Complete CI/CD pipeline with validation, build, and deployment
-- SSH-based deployment for local clients (192.168.1.226 configured)
-- Self-hosted runner support for internet-connected remote clients
-- Automatic version generation with date-based format `v2025.11.25.01`
+3. **Client auto-update agent**
+   - `sbin/pinas-update.sh` polls the Worker, downloads the artifact from R2,
+     verifies SHA-256, installs it, and restarts services.
+   - `docs/pinas-auto-update.{service,timer}` run the updater daily at 03:00.
+   - `sbin/pinas-pull-update.sh` is now a compatibility shim that delegates to
+     `pinas-update.sh`, so legacy cronjobs still work.
 
-### 4. **SSH Infrastructure**
-- Deployment SSH key stored **only** on your workstation (`~/.ssh/pinas_deploy`)
-- Client 192.168.1.226 registered in the deployment system
+4. **Provisioning helpers**
+   - `scripts/manage-clients.sh setup-key <host>` installs the SSH key, creates
+     a client token, registers it with the Worker, and writes
+     `/etc/pinas/update-endpoint.env`.
+   - `scripts/setup-sdcard.sh` copies the new updater and reminds you to run the
+     helper for Worker registration after first boot.
 
-## 🔧 Manual Steps Required
+5. **Docs**
+   - `docs/client-config.md`, `docs/deployment-setup.md`, `SETUP-CHECKLIST.md`,
+     and `DEPLOY-KEY-SOLUTION.md` all describe the Worker/R2 flow.
 
-### Step 1: Add SSH Key to piNAS Client (192.168.1.226)
+## 🧰 Manual Tasks Still Needed
 
-```bash
-# On your workstation
-ssh pi@192.168.1.226 "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
-cat ~/.ssh/pinas_deploy.pub | ssh pi@192.168.1.226 "cat >> ~/.ssh/authorized_keys"
-ssh pi@192.168.1.226 "chmod 600 ~/.ssh/authorized_keys"
-```
+1. **Provision Cloudflare resources**
+   - From `infra/cloudflare/`: `npm install`, create KV + R2 (`wrangler kv
+     namespace create pinas-clients`, `wrangler r2 bucket create pinas-artifacts`),
+     set the IDs in `wrangler.toml`, and deploy with `npm run deploy`.
+   - Store an admin secret: `wrangler secret put ADMIN_TOKEN`.
 
-### Step 2: Add Private Key to GitHub Secrets
+2. **Set local environment variables**
+   ```bash
+   export WORKER_URL="https://pinas-deployer.example.workers.dev"
+   export WORKER_ADMIN_TOKEN="<same value stored with wrangler>"
+   export PINAS_R2_BUCKET="pinas-artifacts"
+   ```
 
-1. Go to your GitHub repository: `Settings` > `Secrets and variables` > `Actions`
-2. Click `New repository secret`
-3. Name: `PINAS_SSH_PRIVATE_KEY`
-4. Value: `cat ~/.ssh/pinas_deploy` (the private key created on your workstation)
+3. **Register each device**
+   ```bash
+   ./scripts/manage-clients.sh add 192.168.1.226 pinas-226
+   ./scripts/manage-clients.sh setup-key 192.168.1.226
+   ./scripts/manage-clients.sh test 192.168.1.226
+   ```
 
-### Step 3: Test the Deployment System
+4. **Publish builds**
+   ```bash
+   ./scripts/publish-artifact.sh --version v2025.11.26.01
+   ```
+   The script prints the R2 object key and checksum; clients will pick it up on
+   their next poll or immediately via `sudo /usr/local/sbin/pinas-update.sh --force`.
 
-```bash
-# Test SSH connection
-cd /Users/danielborrowman/Developer/Projects/piNAS
-./scripts/manage-clients.sh test 192.168.1.226
+## 🚀 Operating the System
 
-# If successful, trigger a test deployment
-echo "# Test automatic deployment $(date)" >> README.md
-git add .
-git commit -m "test: trigger automatic deployment to verify system"
-git push origin main
-```
+- **Add a client**: `./scripts/manage-clients.sh add <ip> <hostname>`
+- **Provision Worker credentials**: `./scripts/manage-clients.sh setup-key <ip>`
+- **Check health**: `./scripts/manage-clients.sh status`
+- **Force update a Pi**: `ssh pi@host sudo /usr/local/sbin/pinas-update.sh --force`
+- **Publish a build**: `./scripts/publish-artifact.sh` (uploads to R2 + notifies Worker)
+- **Monitor**: Worker logs (via `wrangler tail`) and `/var/log/pinas-update.log` on each Pi
 
-## 🚀 Using the Deployment System
-
-### Adding New Clients
-
-```bash
-# For a new SD card with specific client IP
-./scripts/setup-sdcard.sh --client-ip 192.168.1.100 --client-name office-pinas
-
-# Or add existing clients
-./scripts/manage-clients.sh add 192.168.1.150 lab-pinas "Lab piNAS device"
-./scripts/manage-clients.sh setup-key 192.168.1.150
-```
-
-### Client Management Commands
-
-```bash
-./scripts/manage-clients.sh status           # Show deployment status
-./scripts/manage-clients.sh list             # List all clients
-./scripts/manage-clients.sh test <ip>        # Test client connection
-./scripts/manage-clients.sh sync-workflow    # Update GitHub Actions
-```
-
-### Automatic Deployment Triggers
-
-- **Main branch commits**: Automatic deployment to all active clients
-- **Tagged releases**: Deployment with specific version numbers
-- **Manual dispatch**: Deploy to specific clients via GitHub Actions UI
-
-## 📁 Key Files Added/Modified
+## 📦 Repository Highlights
 
 ```
 piNAS/
-├── scripts/
-│   ├── manage-clients.sh       ✅ NEW - Client management system
-│   └── setup-sdcard.sh         🔄 Enhanced with client registration
-├── clients.json                ✅ NEW - Client tracking database  
-├── SSH-SETUP.md               ✅ NEW - Manual SSH setup guide
-├── DEPLOYMENT-COMPLETE.md      ✅ NEW - This summary
-└── .github/workflows/deploy.yml 🔄 Updated with current client
+├── infra/cloudflare/          # Worker + Wrangler config
+├── scripts/publish-artifact.sh
+├── scripts/manage-clients.sh
+├── config/update-endpoint.env.example
+├── sbin/pinas-update.sh
+├── docs/client-config.md
+└── docs/deployment-setup.md
 ```
 
-## 🎯 What Happens Next
-
-Once the manual steps are complete:
-
-1. **Every commit to main** triggers automatic deployment to all active clients
-2. **Your piNAS at 192.168.1.226** will automatically update within minutes
-3. **New clients** can be added easily with the management scripts
-4. **Remote clients** can self-register using GitHub Actions runners
-5. **Version tracking** shows exactly what's deployed where
-
-The system is production-ready and will provide seamless updates to your piNAS infrastructure! 🎉
+The system now runs entirely through Cloudflare Worker + R2. Once the enterprise
+billing hold is cleared you can still re-enable the GitHub workflow, but no part
+of the new deployment path depends on GitHub Actions. 🎉

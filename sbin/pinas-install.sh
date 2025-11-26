@@ -280,14 +280,21 @@ setup_install_display() {
   echo "--- Setting up venv + install-time TFT log viewer (XC9022) ---"
   progress_note init_display "Preparing dashboard virtualenv"
 
+  # Ensure background display process is killed on exit
+  trap 'pkill -f pinas-install-display.py 2>/dev/null || true' EXIT
+
   mkdir -p /opt/pinas-dashboard
 
   # Always ensure build dependencies are present for Blinka/sysv_ipc
   progress_note init_display "Installing python3-dev/build deps"
   install_apt_pkgs python3-venv python3-pip python3-dev libjpeg-dev zlib1g-dev python3-setuptools python3-wheel gcc
 
-  if ! python3 -m venv /opt/pinas-dashboard/.venv 2>/dev/null; then
-    python3 -m venv /opt/pinas-dashboard/.venv
+  # Create virtual environment for dashboard
+  if [ ! -d /opt/pinas-dashboard/.venv ]; then
+    python3 -m venv /opt/pinas-dashboard/.venv || {
+      echo "ERROR: Failed to create virtual environment" >&2
+      return 1
+    }
   fi
 
   /opt/pinas-dashboard/.venv/bin/pip install --upgrade pip setuptools wheel || true
@@ -1401,6 +1408,24 @@ install_packages() {
   install_apt_pkgs "${NAS_APT_PKGS[@]}"
 }
 
+ensure_worker_config_placeholder() {
+  local sample="$INSTALL_DIR/config/update-endpoint.env.example"
+  local target_dir="/etc/pinas"
+  local target="$target_dir/update-endpoint.env"
+
+  if [ ! -f "$sample" ]; then
+    return
+  fi
+
+  mkdir -p "$target_dir"
+
+  if [ ! -f "$target" ]; then
+    cp "$sample" "$target"
+    chmod 600 "$target"
+    echo "Placed placeholder Worker config at $target (run manage-clients setup-key to populate)."
+  fi
+}
+
 finalize_install() {
   echo "--- Finalizing piNAS installation ---"
   progress_note finalize "Installing update system"
@@ -1432,6 +1457,8 @@ finalize_install() {
       echo "local-install" > "$INSTALL_DIR/BUILD_SOURCE"
     fi
   fi
+
+  ensure_worker_config_placeholder
   
   progress_note finalize "Switching to permanent dashboard"
 

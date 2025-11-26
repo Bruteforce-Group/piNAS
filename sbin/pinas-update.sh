@@ -1,43 +1,34 @@
 #!/bin/bash
 set -euo pipefail
 
-# piNAS Client Update Script
-# Checks for and applies updates from GitHub releases
+# piNAS Client Update Script (Cloudflare Worker + R2 backed)
+# Polls the deployment Worker for the latest artifact and installs it locally.
 
-GITHUB_REPO="Bruteforce-Group/piNAS"
-GITHUB_API="https://api.github.com/repos/$GITHUB_REPO"
 INSTALL_DIR="/usr/local/pinas"
 BACKUP_DIR="/usr/local/pinas-backup"
 TEMP_DIR="/tmp/pinas-update"
 LOG_FILE="/var/log/pinas-update.log"
+CONFIG_FILE="/etc/pinas/update-endpoint.env"
+STATE_FILE="$TEMP_DIR/state.json"
 
-# Ensure logging directory exists
+# Ensure logging directory exists and mirror all output to the log file.
 mkdir -p "$(dirname "$LOG_FILE")"
-
-# Mirror all output to log file
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "==== piNAS Update Check Starting at $(date) ===="
 
 usage() {
-    cat << EOF
-Usage: $0 [OPTIONS]
+    cat <<'USAGE'
+Usage: pinas-update [OPTIONS]
 
 Options:
-    --check-only        Only check for updates, don't install
-    --force            Force update even if versions match
-    --version VERSION  Install specific version (tag name)
-    --help             Show this help message
-
-Examples:
-    $0                 # Check for and install latest update
-    $0 --check-only    # Only check if updates are available
-    $0 --version v1.2.3 # Install specific version
-    $0 --force         # Force reinstall current version
-EOF
+  --check-only        Query the Worker but do not install anything.
+  --force             Install even if the reported version matches.
+  --version VERSION   Request a specific version (must exist in R2).
+  --help              Show this help text.
+USAGE
 }
 
-# Parse command line arguments
 CHECK_ONLY=false
 FORCE_UPDATE=false
 SPECIFIC_VERSION=""
@@ -56,7 +47,7 @@ while [[ $# -gt 0 ]]; do
             SPECIFIC_VERSION="$2"
             shift 2
             ;;
-        --help)
+        --help|-h)
             usage
             exit 0
             ;;
@@ -68,213 +59,255 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Function to get current installed version
-get_current_version() {
-    if [ -f "$INSTALL_DIR/VERSION" ]; then
-        cat "$INSTALL_DIR/VERSION"
-    else
-        echo "unknown"
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "ERROR: Missing required command '$1'" >&2
+        exit 1
     fi
 }
 
-# Function to get latest release from GitHub
-get_latest_release() {
-    curl -s "$GITHUB_API/releases/latest" | grep '"tag_name":' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/'
+safe_sha256() {
+    local file="$1"
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    else
+        sha256sum "$file" | awk '{print $1}'
+    fi
 }
 
-# Function to get specific release info
-get_release_info() {
-    local version="$1"
-    curl -s "$GITHUB_API/releases/tags/$version"
+load_worker_config() {
+    if [ ! -r "$CONFIG_FILE" ]; then
+        echo "ERROR: Missing worker config at $CONFIG_FILE" >&2
+        echo "Create it via scripts/manage-clients.sh setup-key <client>."
+        exit 1
+    fi
+
+    # Validate config file permissions for security
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "ERROR: Config file not found: $CONFIG_FILE" >&2
+        exit 1
+    fi
+
+    # Check file permissions (should be 600 or 640)
+    if command -v stat >/dev/null 2>&1; then
+        config_perms=$(stat -f%Lp "$CONFIG_FILE" 2>/dev/null || stat -c%a "$CONFIG_FILE" 2>/dev/null || echo "unknown")
+        if [ "$config_perms" != "600" ] && [ "$config_perms" != "640" ] && [ "$config_perms" != "unknown" ]; then
+            echo "WARNING: $CONFIG_FILE has permissions $config_perms (should be 600)" >&2
+            echo "  Run: sudo chmod 600 $CONFIG_FILE" >&2
+        fi
+    fi
+
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+
+    WORKER_URL="${WORKER_URL:-${PINAS_WORKER_URL:-}}"
+    CLIENT_ID="${CLIENT_ID:-${PINAS_CLIENT_ID:-}}"
+    CLIENT_TOKEN="${CLIENT_TOKEN:-${PINAS_CLIENT_TOKEN:-}}"
+
+    if [ -z "$WORKER_URL" ] || [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_TOKEN" ]; then
+        echo "ERROR: WORKER_URL, CLIENT_ID, and CLIENT_TOKEN must be set in $CONFIG_FILE" >&2
+        exit 1
+    fi
+
+    # Normalise URL (drop trailing slash)
+    WORKER_URL="${WORKER_URL%/}"
 }
 
-# Function to download and verify update package
+build_state_payload() {
+    python3 - "$1" "$2" <<'PY'
+import json
+import sys
+payload = {"currentVersion": sys.argv[1]}
+if len(sys.argv) > 2 and sys.argv[2]:
+    payload["desiredVersion"] = sys.argv[2]
+print(json.dumps(payload))
+PY
+}
+
+request_worker_state() {
+    local payload
+    payload="$(build_state_payload "$1" "$2")"
+
+    # Use curl config file to avoid exposing credentials in process list
+    curl -sfS -X POST "$WORKER_URL/client/state" \
+        -K <(cat <<EOF
+-H "Content-Type: application/json"
+-H "X-Client-Id: $CLIENT_ID"
+-H "X-Client-Token: $CLIENT_TOKEN"
+EOF
+        ) \
+        -d "$payload" > "$STATE_FILE"
+}
+
+parse_state_field() {
+    python3 - "$STATE_FILE" <<'PY'
+import json
+import sys
+with open(sys.argv[1], 'r', encoding='utf-8') as fh:
+    data = json.load(fh)
+latest = data.get('latest') or {}
+print('true' if data.get('updateAvailable') else 'false')
+print(latest.get('version', ''))
+print(data.get('downloadPath') or '')
+print(latest.get('sha256') or '')
+print(str(latest.get('size') or ''))
+print(str(data.get('pollIntervalSeconds') or ''))
+PY
+}
+
 download_update() {
     local version="$1"
-    local download_url="https://github.com/$GITHUB_REPO/releases/download/$version/pinas-$version.tar.gz"
-    
-    echo "Downloading piNAS $version..."
+    local download_url="$2"
+    local expected_sha="$3"
+
+    if [ -z "$download_url" ]; then
+        echo "ERROR: Worker did not return a download URL" >&2
+        exit 1
+    fi
+
     mkdir -p "$TEMP_DIR"
-    cd "$TEMP_DIR"
-    
-    if ! curl -L -o "pinas-$version.tar.gz" "$download_url"; then
-        echo "ERROR: Failed to download update package"
-        return 1
+    local archive="$TEMP_DIR/pinas-$version.tar.gz"
+
+    echo "Downloading piNAS $version from worker..."
+    curl -fSL "$download_url" \
+        -H "X-Client-Id: $CLIENT_ID" \
+        -H "X-Client-Token: $CLIENT_TOKEN" \
+        -o "$archive"
+
+    if [ -n "$expected_sha" ]; then
+        local actual_sha
+        actual_sha="$(safe_sha256 "$archive")"
+        if [ "$actual_sha" != "$expected_sha" ]; then
+            echo "ERROR: SHA mismatch (expected $expected_sha, got $actual_sha)" >&2
+            exit 1
+        fi
     fi
-    
+
     echo "Extracting package..."
-    if ! tar -xzf "pinas-$version.tar.gz"; then
-        echo "ERROR: Failed to extract update package"
-        return 1
+    tar -xzf "$archive" -C "$TEMP_DIR"
+
+    if [ ! -f "$TEMP_DIR/pinas-$version/VERSION" ]; then
+        echo "ERROR: Extracted package missing VERSION file" >&2
+        exit 1
     fi
-    
-    # Verify package integrity
-    if [ ! -f "pinas-$version/VERSION" ]; then
-        echo "ERROR: Invalid update package - missing VERSION file"
-        return 1
-    fi
-    
-    local package_version
-    package_version=$(cat "pinas-$version/VERSION")
-    if [ "$package_version" != "$version" ]; then
-        echo "ERROR: Version mismatch - expected $version, got $package_version"
-        return 1
-    fi
-    
-    echo "Package verification successful"
-    return 0
 }
 
-# Function to create backup
 create_backup() {
     if [ -d "$INSTALL_DIR" ]; then
-        local backup_path="$BACKUP_DIR-$(date +%Y%m%d-%H%M%S)"
-        echo "Creating backup at $backup_path..."
-        sudo cp -r "$INSTALL_DIR" "$backup_path"
-        echo "Backup created successfully"
+        local dest="$BACKUP_DIR-$(date +%Y%m%d-%H%M%S)"
+        echo "Creating backup at $dest..."
+        sudo cp -r "$INSTALL_DIR" "$dest"
     fi
 }
 
-# Function to apply update
 apply_update() {
     local version="$1"
     local package_dir="$TEMP_DIR/pinas-$version"
-    
+
     echo "Applying update to piNAS $version..."
-    
-    # Create backup first
     create_backup
-    
-    # Stop services gracefully
+
     echo "Stopping piNAS services..."
     sudo systemctl stop pinas-dashboard.service 2>/dev/null || true
     sudo systemctl stop pinas-usb-gadget.service 2>/dev/null || true
-    
-    # Install new version
+
     sudo mkdir -p "$INSTALL_DIR"
     sudo cp -r "$package_dir"/* "$INSTALL_DIR"/
-    
-    # Update system scripts
+
     echo "Updating system scripts..."
     sudo cp "$INSTALL_DIR/sbin/pinas-install.sh" /usr/local/sbin/
     sudo cp "$INSTALL_DIR/sbin/pinas-cache-deps.sh" /usr/local/sbin/
     sudo cp "$INSTALL_DIR/sbin/pinas-update.sh" /usr/local/sbin/
     sudo chmod +x /usr/local/sbin/pinas-*.sh
-    
-    # Verify installation
+
     echo "Verifying installation..."
-    if ! bash -n /usr/local/sbin/pinas-install.sh; then
-        echo "ERROR: New installer script has syntax errors"
-        return 1
-    fi
-    
-    if ! bash -n /usr/local/sbin/pinas-cache-deps.sh; then
-        echo "ERROR: New cache script has syntax errors"
-        return 1
-    fi
-    
-    # Restart services
+    bash -n /usr/local/sbin/pinas-install.sh
+    bash -n /usr/local/sbin/pinas-cache-deps.sh
+
     echo "Restarting piNAS services..."
     sudo systemctl start pinas-dashboard.service 2>/dev/null || true
     sudo systemctl start pinas-usb-gadget.service 2>/dev/null || true
-    
+
     echo "Update applied successfully!"
     echo "New version: $(cat "$INSTALL_DIR/VERSION")"
     echo "Build date: $(cat "$INSTALL_DIR/BUILD_DATE")"
-    
-    return 0
 }
 
-# Function to cleanup temp files
 cleanup() {
-    if [ -d "$TEMP_DIR" ]; then
-        rm -rf "$TEMP_DIR"
-    fi
+    rm -rf "$TEMP_DIR"
 }
 
-# Set trap to cleanup on exit
 trap cleanup EXIT
 
-# Main update logic
 main() {
-    local current_version
-    local target_version
-    
-    current_version=$(get_current_version)
+    require_command curl
+    require_command python3
+    require_command tar
+    load_worker_config
+
+    local current_version target_version download_path sha size poll_interval download_url state_values
+
+    current_version="$(cat "$INSTALL_DIR/VERSION" 2>/dev/null || echo "unknown")"
     echo "Current piNAS version: $current_version"
-    
-    if [ -n "$SPECIFIC_VERSION" ]; then
+
+    mkdir -p "$TEMP_DIR"
+    request_worker_state "$current_version" "$SPECIFIC_VERSION"
+
+    mapfile -t state_values < <(parse_state_field)
+    local update_available="${state_values[0]}"
+    target_version="${state_values[1]}"
+    download_path="${state_values[2]}"
+    sha="${state_values[3]}"
+    size="${state_values[4]}"
+    poll_interval="${state_values[5]}"
+
+    if [ -z "$target_version" ] && [ -n "$SPECIFIC_VERSION" ]; then
         target_version="$SPECIFIC_VERSION"
-        echo "Target version (specified): $target_version"
-    else
-        echo "Checking for latest release..."
-        target_version=$(get_latest_release)
-        if [ -z "$target_version" ]; then
-            echo "ERROR: Could not determine latest release version"
-            exit 1
-        fi
-        echo "Latest available version: $target_version"
+        download_path="/artifact?objectKey=${target_version}/pinas-${target_version}.tar.gz"
     fi
-    
-    # Check if update is needed
-    if [ "$current_version" = "$target_version" ] && [ "$FORCE_UPDATE" = "false" ]; then
-        echo "piNAS is already up to date (version $current_version)"
-        exit 0
-    fi
-    
-    if [ "$CHECK_ONLY" = "true" ]; then
-        if [ "$current_version" != "$target_version" ]; then
-            echo "Update available: $current_version → $target_version"
-            exit 1  # Exit code 1 indicates update available
-        else
-            echo "No updates available"
-            exit 0
-        fi
-    fi
-    
-    # Verify we can reach the release
-    echo "Verifying release availability..."
-    if [ -n "$SPECIFIC_VERSION" ]; then
-        if ! get_release_info "$target_version" >/dev/null; then
-            echo "ERROR: Release $target_version not found"
-            exit 1
-        fi
-    fi
-    
-    # Check available disk space
-    available_space=$(df / | tail -1 | awk '{print $4}')
-    if [ "$available_space" -lt 500000 ]; then  # 500MB in KB
-        echo "WARNING: Low disk space. Available: ${available_space}KB"
-        echo "Update may fail. Consider freeing up space first."
-    fi
-    
-    # Download and apply update
-    if download_update "$target_version"; then
-        if apply_update "$target_version"; then
-            echo "piNAS successfully updated to version $target_version"
-            echo "Update completed at $(date)"
-        else
-            echo "ERROR: Failed to apply update"
-            exit 1
-        fi
-    else
-        echo "ERROR: Failed to download update"
+
+    if [ -z "$target_version" ]; then
+        echo "ERROR: Worker did not return a target version" >&2
         exit 1
     fi
+
+    if [[ "$download_path" =~ ^https?:// ]]; then
+        download_url="$download_path"
+    else
+        download_url="$WORKER_URL$download_path"
+    fi
+
+    echo "Worker reports latest version: $target_version"
+    if [ -n "$size" ]; then
+        echo "Package size: $size bytes"
+    fi
+    if [ -n "$poll_interval" ]; then
+        echo "Recommended poll interval: $poll_interval seconds"
+    fi
+
+    if [ "$update_available" != "true" ] && [ "$FORCE_UPDATE" = "false" ]; then
+        echo "piNAS is already up to date."
+        exit 0
+    fi
+
+    if [ "$CHECK_ONLY" = "true" ]; then
+        if [ "$update_available" = "true" ]; then
+            echo "Update available: $current_version → $target_version"
+            exit 1
+        fi
+        echo "No updates available"
+        exit 0
+    fi
+
+    download_update "$target_version" "$download_url" "$sha"
+    apply_update "$target_version"
+
+    echo "piNAS successfully updated to version $target_version"
+    echo "==== piNAS Update Check Completed at $(date) ====="
 }
 
-# Check if running as root (some operations require sudo)
-if [ "$(id -u)" -eq 0 ]; then
-    echo "WARNING: Running as root. This script should typically be run as pi user with sudo access."
+if ! ping -c1 -W1 1.1.1.1 >/dev/null 2>&1; then
+    echo "WARNING: Could not reach 1.1.1.1. Continuing with Worker request." >&2
 fi
 
-# Check internet connectivity
-if ! ping -c1 -W1 8.8.8.8 >/dev/null 2>&1; then
-    echo "ERROR: No internet connectivity. Cannot check for updates."
-    exit 1
-fi
-
-# Run main function
 main "$@"
-
-echo "==== piNAS Update Check Completed at $(date) ====="

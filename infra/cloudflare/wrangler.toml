@@ -1,0 +1,32 @@
+name = "pinas-deployer"
+main = "src/index.ts"
+compatibility_date = "2025-11-26"
+compatibility_flags = ["nodejs_compat"]
+
+# Replace the placeholder IDs below with the output of
+# `wrangler kv namespace create pinas-clients` and the
+# real R2 bucket names before deploying.
+[[kv_namespaces]]
+binding = "CLIENTS_KV"
+id = "00000000000000000000000000000000"
+preview_id = "00000000000000000000000000000001"
+
+[[r2_buckets]]
+binding = "ARTIFACTS_BUCKET"
+bucket_name = "pinas-artifacts"
+preview_bucket_name = "pinas-artifacts-dev"
+
+[vars]
+# Default poll interval (seconds) returned to clients unless overridden per-env
+CLIENT_POLL_INTERVAL_SECONDS = "300"
+# Optional fallback URL for documentation links returned by the worker
+DOCUMENTATION_URL = "https://github.com/Bruteforce-Group/piNAS"
+
+[env.production]
+# Override bindings/vars here if production uses different namespaces/buckets
+# [[env.production.kv_namespaces]]
+# ...
+# [[env.production.r2_buckets]]
+# ...
+[env.production.vars]
+CLIENT_POLL_INTERVAL_SECONDS = "180"
