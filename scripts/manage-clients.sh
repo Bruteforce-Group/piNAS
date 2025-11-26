@@ -258,7 +258,9 @@ setup_key_on_client() {
     local client_json client_id client_name client_notes
     client_json="$(get_client_by_ip_or_hostname "$identifier" || true)"
     if [ -n "$client_json" ]; then
-        readarray -t client_meta < <(python3 <<'PY' <<<"$client_json"
+        # Parse JSON using Python and store in variables (portable across bash/zsh)
+        local client_info
+        client_info="$(python3 <<'PY' <<<"$client_json"
 import json
 import sys
 data = json.load(sys.stdin)
@@ -266,10 +268,10 @@ print(data.get("client_id", ""))
 print(data.get("hostname") or data.get("ip") or "")
 print(data.get("description") or "")
 PY
-)
-        client_id="${client_meta[0]}"
-        client_name="${client_meta[1]}"
-        client_notes="${client_meta[2]}"
+)"
+        client_id="$(echo "$client_info" | sed -n '1p')"
+        client_name="$(echo "$client_info" | sed -n '2p')"
+        client_notes="$(echo "$client_info" | sed -n '3p')"
     fi
 
     if [ -z "$client_id" ]; then
@@ -334,7 +336,6 @@ except:
 
     log INFO "Testing deployment key..."
     test_client "$identifier"
-}
 }
 
 test_client() {
