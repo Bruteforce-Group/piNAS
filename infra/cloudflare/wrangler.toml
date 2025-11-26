@@ -2,14 +2,15 @@ name = "pinas-deployer"
 main = "src/index.ts"
 compatibility_date = "2025-11-26"
 compatibility_flags = ["nodejs_compat"]
+account_id = "0b0ee2b5eaf1fb8a2612e40ab6488052"
 
 # Replace the placeholder IDs below with the output of
 # `wrangler kv namespace create pinas-clients` and the
 # real R2 bucket names before deploying.
 [[kv_namespaces]]
 binding = "CLIENTS_KV"
-id = "00000000000000000000000000000000"
-preview_id = "00000000000000000000000000000001"
+id = "035c5c001ac34ad297e57acd8883bfaf"
+preview_id = "f7149a3a99a24a9791b902936e7dc81a"
 
 [[r2_buckets]]
 binding = "ARTIFACTS_BUCKET"
