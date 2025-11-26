@@ -4,6 +4,11 @@ compatibility_date = "2025-11-26"
 compatibility_flags = ["nodejs_compat"]
 account_id = "0b0ee2b5eaf1fb8a2612e40ab6488052"
 
+# Custom domain route
+routes = [
+  { pattern = "pinas.bozza.au/*", zone_name = "bozza.au" }
+]
+
 # Replace the placeholder IDs below with the output of
 # `wrangler kv namespace create pinas-clients` and the
 # real R2 bucket names before deploying.
