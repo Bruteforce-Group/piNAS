@@ -387,6 +387,46 @@ const handleArtifactDownload = async (request: Request, env: Env): Promise<Respo
 
 const handleNotFound = async (): Promise<Response> => notFound();
 
+const handleDashboard = async (env: Env): Promise<Response> => {
+  // Serve the latest dashboard screenshot from R2
+  const object = await env.ARTIFACTS_BUCKET.get("dashboard/live.png");
+  if (!object || !object.body) {
+    return jsonResponse({ error: "Dashboard image not available" }, { status: 404 });
+  }
+
+  const headers = new Headers();
+  headers.set("content-type", "image/png");
+  headers.set("cache-control", "no-cache, no-store, must-revalidate");
+  headers.set("pragma", "no-cache");
+  headers.set("expires", "0");
+
+  return new Response(object.body, { headers });
+};
+
+const handleDashboardUpload = async (request: Request, env: Env): Promise<Response> => {
+  // Allow clients to upload dashboard screenshots
+  const client = await authenticateClient(request, env);
+  if (!client) {
+    return unauthorized();
+  }
+
+  const contentType = request.headers.get("content-type");
+  if (!contentType?.includes("image/png")) {
+    return badRequest("Content-Type must be image/png");
+  }
+
+  const body = await request.arrayBuffer();
+  if (body.byteLength === 0) {
+    return badRequest("Empty image body");
+  }
+
+  await env.ARTIFACTS_BUCKET.put("dashboard/live.png", body, {
+    httpMetadata: { contentType: "image/png" },
+  });
+
+  return jsonResponse({ status: "ok", uploaded: true, size: body.byteLength });
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -394,6 +434,17 @@ export default {
 
     if (segments.length === 0 && request.method === "GET") {
       return textResponse("piNAS deployment worker is online\n", { status: 200 });
+    }
+
+    // Dashboard routes
+    if (segments[0] === "dashboard") {
+      if (request.method === "GET") {
+        return handleDashboard(env);
+      }
+      if (request.method === "POST" || request.method === "PUT") {
+        return handleDashboardUpload(request, env);
+      }
+      return badRequest("Use GET to view or POST/PUT to upload dashboard");
     }
 
     if (segments[0] === "healthz") {
