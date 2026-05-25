@@ -2,7 +2,7 @@ name = "pinas-deployer"
 main = "src/index.ts"
 compatibility_date = "2025-11-26"
 compatibility_flags = ["nodejs_compat"]
-account_id = "0b0ee2b5eaf1fb8a2612e40ab6488052"
+account_id = "dac01715f027bf360c500dce1d805d94"
 workers_dev = true
 
 # Custom domain route
