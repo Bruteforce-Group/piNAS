@@ -11,3 +11,7 @@ boot/user-data
 .env
 *.env
 !*.env.example
+
+# IDE / AI tool configs
+.claude/
+.cursor/
