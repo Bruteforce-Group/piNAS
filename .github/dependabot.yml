@@ -1,0 +1,21 @@
+# Managed by Bruteforce-Group/github-governance: created once when missing, then yours to edit.
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directories:
+      - "/infra/cloudflare"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+      timezone: "Australia/Brisbane"
+    open-pull-requests-limit: 5
+    groups:
+      npm-version-updates:
+        applies-to: "version-updates"
+        patterns:
+          - "*"
+      npm-security-updates:
+        applies-to: "security-updates"
+        patterns:
+          - "*"
